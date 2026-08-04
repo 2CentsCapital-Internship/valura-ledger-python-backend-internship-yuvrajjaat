@@ -4,3 +4,9 @@ __pycache__/
 venv/
 .env
 key.txt
+
+# dev-only debug capture from `client.py --debug`
+debug_*.jsonl
+
+# local testing helpers, not part of the assignment
+postman/

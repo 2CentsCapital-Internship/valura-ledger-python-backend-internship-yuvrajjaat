@@ -25,14 +25,23 @@ import httpx
 from book import Book
 
 
+def _log(path: str, obj) -> None:
+    """Append one JSON line to a debug file. Used only with --debug, so a
+    graded run never writes anything and its behaviour is unchanged."""
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, default=str) + "\n")
+
+
 class ArenaClient:
     def __init__(self, url: str, key: str, mode: str,
-                 batch: int = 100, flush_ms: int = 400) -> None:
+                 batch: int = 100, flush_ms: int = 400,
+                 debug: bool = False) -> None:
         self.url = url.rstrip("/")
         self.key = key
         self.mode = mode
         self.batch = batch
         self.flush_ms = flush_ms
+        self.debug = debug
         self.book = Book()
         self.pending: list[dict] = []
         self.cursor = 0
@@ -56,6 +65,11 @@ class ArenaClient:
                 return
             r.raise_for_status()
             self.stats["posted"] += len(body["postings"])
+            if self.debug:
+                try:
+                    _log("debug_feedback.jsonl", r.json())
+                except Exception:
+                    pass
         except httpx.HTTPError:
             self.stats["errors"] += 1
             self.pending = body["postings"] + self.pending
@@ -72,9 +86,15 @@ class ArenaClient:
         snap = self.book.snapshot()
         self.flush(http)
         try:
-            http.post(f"{self.url}/v1/checkpoint", params={"mode": self.mode},
-                      json={"checkpoint_id": cp_id, **snap}, timeout=30)
+            r = http.post(f"{self.url}/v1/checkpoint", params={"mode": self.mode},
+                          json={"checkpoint_id": cp_id, **snap}, timeout=30)
             self.stats["checkpoints"] += 1
+            if self.debug:
+                try:
+                    _log("debug_checkpoint.jsonl",
+                         {"checkpoint_id": cp_id, "sent": snap, "resp": r.json()})
+                except Exception:
+                    pass
         except httpx.HTTPError:
             self.stats["errors"] += 1
 
@@ -84,6 +104,12 @@ class ArenaClient:
         # An event you correctly reject still needs a submission, with no legs.
         self.pending.append({"event_id": ev["event_id"], "legs": legs or []})
         self.stats["events"] += 1
+        if self.debug:
+            _log("debug_events.jsonl",
+                 {"offset": ev.get("offset"), "type": ev.get("type"),
+                  "event_id": ev.get("event_id"),
+                  "backdated_days": ev.get("backdated_days"),
+                  "payload": ev.get("payload"), "our_legs": legs or []})
 
     def consume(self, http: httpx.Client, deadline: float) -> None:
         params = {"mode": self.mode, "from": self.cursor}
@@ -155,11 +181,22 @@ class ArenaClient:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="https://hiring-arena.twocc.in")
-    ap.add_argument("--key", required=True, help="your API key from the portal")
+    ap.add_argument("--key", help="your API key (falls back to key.txt)")
     ap.add_argument("--mode", default="practice",
                     choices=["practice", "submission", "final"])
     ap.add_argument("--seconds", type=float, default=1500)
+    ap.add_argument("--debug", action="store_true",
+                    help="log events/feedback to debug_*.jsonl (dev only)")
     a = ap.parse_args()
+
+    key = a.key
+    if not key:
+        try:
+            key = open("key.txt", encoding="utf-8").read().strip()
+        except OSError:
+            pass
+    if not key:
+        ap.error("no API key: pass --key or put it in key.txt")
 
     if a.mode != "practice":
         print(f"\n  You are about to start a {a.mode.upper()} run.")
@@ -168,7 +205,7 @@ def main() -> int:
             print("  Cancelled.")
             return 1
 
-    c = ArenaClient(a.url, a.key, a.mode)
+    c = ArenaClient(a.url, key, a.mode, debug=a.debug)
     print(f"connecting to {a.url} as {a.mode} ...", flush=True)
     out = c.run(a.seconds)
     print("\nstats:", json.dumps(out["stats"]))
