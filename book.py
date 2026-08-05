@@ -84,6 +84,7 @@ class Book:
 
         self.withdrawals: dict[str, dict] = {}
         self.fee_refunded: set[str] = set()
+        self.orders: dict[str, dict] = {}
 
         self.todo: dict[str, int] = defaultdict(int)
         self.errors: list[tuple] = []
@@ -196,7 +197,19 @@ class Book:
         return legs
 
     def on_order_placed(self, p, ev):
-        raise NotImplementedError
+        oid = p["order_id"]
+        side = p["side"]
+        qty = D(p["quantity"])
+        notional = qty * D(p["limit_price"])
+        route = route_for(p["asset_class"], notional)
+        if side == "buy":
+            hold = money(notional + D(p["est_charges"]))
+        else:
+            hold = ZERO
+        self.orders[oid] = {"customer_id": p["customer_id"], "side": side,
+                            "symbol": p["symbol"], "route": route,
+                            "cash_hold": hold, "open": True}
+        return []
 
     def on_order_partially_filled(self, p, ev):
         return self.on_order_filled(p, ev)
@@ -208,7 +221,11 @@ class Book:
         raise NotImplementedError
 
     def on_order_cancelled(self, p, ev):
-        raise NotImplementedError
+        o = self.orders.get(p["order_id"])
+        if o is not None:
+            o["open"] = False
+            o["cash_hold"] = ZERO
+        return []
 
     def on_order_rejected(self, p, ev):
         return self.on_order_cancelled(p, ev)
@@ -256,11 +273,21 @@ class Book:
             tb[acct] += bal
 
         customers: dict[str, dict] = {}
+
+        def cust(cid):
+            return customers.setdefault(cid, {"wallet_cash": ZERO,
+                                              "cash_hold": ZERO, "positions": {}})
+
         for (cid, acct), bal in self.balances.items():
-            c = customers.setdefault(cid, {"wallet_cash": ZERO,
-                                           "cash_hold": ZERO, "positions": {}})
             if acct == "2010":
-                c["wallet_cash"] += -bal
+                cust(cid)["wallet_cash"] += -bal
+
+        for o in self.orders.values():
+            if o["open"] and o["cash_hold"] != ZERO:
+                cust(o["customer_id"])["cash_hold"] += o["cash_hold"]
+
+        routes = {oid: o["route"] for oid, o in self.orders.items()
+                  if o["open"]}
 
         return {
             "trial_balance": {a: str(money(v)) for a, v in sorted(tb.items())},
@@ -268,7 +295,7 @@ class Book:
                                 "cash_hold": str(money(c["cash_hold"])),
                                 "positions": c["positions"]}
                           for cid, c in sorted(customers.items())},
-            "open_order_routes": {},
+            "open_order_routes": routes,
         }
 
 
