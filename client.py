@@ -26,8 +26,6 @@ from book import Book
 
 
 def _log(path: str, obj) -> None:
-    """Append one JSON line to a debug file. Used only with --debug, so a
-    graded run never writes anything and its behaviour is unchanged."""
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(obj, default=str) + "\n")
 
@@ -75,7 +73,7 @@ class ArenaClient:
             self.pending = body["postings"] + self.pending
             time.sleep(1)
 
-    def checkpoint(self, http: httpx.Client, cp_id: str) -> None:
+    def checkpoint(self, http: httpx.Client, payload: dict) -> None:
         """Snapshot FIRST, send second.
 
         The reply must describe your book as at the checkpoint's place in the
@@ -83,7 +81,8 @@ class ArenaClient:
         another thread while the stream keeps running, reports a later state
         than the one being asked about.
         """
-        snap = self.book.snapshot()
+        cp_id = payload["checkpoint_id"]
+        snap = self.book.snapshot(as_of_event_id=payload.get("as_of_event_id"))
         self.flush(http)
         try:
             r = http.post(f"{self.url}/v1/checkpoint", params={"mode": self.mode},
@@ -148,7 +147,9 @@ class ArenaClient:
                     else:
                         self.cursor = max(self.cursor, ev.get("offset", 0) + 1)
                         if ev["type"] == "checkpoint_request":
-                            self.checkpoint(http, ev["payload"]["checkpoint_id"])
+                            if self.debug:
+                                _log("debug_checkpoint_req.jsonl", ev["payload"])
+                            self.checkpoint(http, ev["payload"])
                         else:
                             self.handle(ev)
 
