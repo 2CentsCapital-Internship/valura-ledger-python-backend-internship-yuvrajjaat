@@ -85,6 +85,9 @@ class Book:
         self.withdrawals: dict[str, dict] = {}
         self.fee_refunded: set[str] = set()
         self.orders: dict[str, dict] = {}
+        self.lots: dict[tuple[str, str], list] = defaultdict(list)
+        self.lot_seq: int = 0
+        self.trades: dict[str, dict] = {}
 
         self.todo: dict[str, int] = defaultdict(int)
         self.errors: list[tuple] = []
@@ -202,20 +205,105 @@ class Book:
         qty = D(p["quantity"])
         notional = qty * D(p["limit_price"])
         route = route_for(p["asset_class"], notional)
-        if side == "buy":
-            hold = money(notional + D(p["est_charges"]))
-        else:
-            hold = ZERO
+        hold = money(notional + D(p["est_charges"])) if side == "buy" else ZERO
         self.orders[oid] = {"customer_id": p["customer_id"], "side": side,
                             "symbol": p["symbol"], "route": route,
-                            "cash_hold": hold, "open": True}
+                            "qty_total": qty, "qty_filled": ZERO,
+                            "hold_total": hold, "hold_remaining": hold,
+                            "open": True}
         return []
 
     def on_order_partially_filled(self, p, ev):
-        return self.on_order_filled(p, ev)
+        return self._fill(p, final=False)
 
     def on_order_filled(self, p, ev):
-        raise NotImplementedError
+        return self._fill(p, final=True)
+
+    def _fill(self, p, final: bool) -> list[dict]:
+        cid = p["customer_id"]
+        side = p["side"]
+        symbol = p["symbol"]
+        qty = D(p["quantity"])
+        principal = money(p["principal"])
+
+        o = self.orders.get(p.get("order_id"))
+        if o is not None:
+            if not o["open"] or qty > o["qty_total"] - o["qty_filled"]:
+                raise Rejected("overfill")
+
+        f = compute_fees(p["broker"], principal, D(p["partner_rate"]))
+        b, c, r = f["b"], f["c"], f["r"]
+        bc, cc, ps, pay = f["bc"], f["cc"], f["ps"], f["payable"]
+
+        if side == "buy":
+            self._add_lot(cid, symbol, qty, principal)
+            legs = [leg("2010", cid, debit=principal + b + c + r),
+                    leg("1200", cid, debit=principal),
+                    leg("2350", cid, credit=principal),
+                    leg("2100", cid, credit=principal),
+                    leg("4000", cid, credit=b),
+                    leg("4010", cid, credit=c),
+                    leg("2400", cid, credit=r),
+                    leg("5000", cid, debit=bc),
+                    leg(pay, cid, credit=bc),
+                    leg("5010", cid, debit=cc),
+                    leg("2420", cid, credit=cc),
+                    leg("5100", cid, debit=ps),
+                    leg("2430", cid, credit=ps)]
+        else:
+            cost = self._relieve_fifo(cid, symbol, qty)
+            legs = [leg("1150", cid, debit=principal),
+                    leg("2010", cid, credit=principal - b - c - r),
+                    leg("2100", cid, debit=cost),
+                    leg("1200", cid, credit=cost),
+                    leg("4000", cid, credit=b),
+                    leg("4010", cid, credit=c),
+                    leg("2400", cid, credit=r),
+                    leg("5000", cid, debit=bc),
+                    leg(pay, cid, credit=bc),
+                    leg("5010", cid, debit=cc),
+                    leg("2420", cid, credit=cc),
+                    leg("5100", cid, debit=ps),
+                    leg("2430", cid, credit=ps)]
+
+        self.trades[p["trade_id"]] = {"side": side, "principal": principal,
+                                      "customer_id": cid}
+        if o is not None:
+            o["qty_filled"] += qty
+            if o["side"] == "buy" and not final and o["qty_total"] > ZERO:
+                rel = money(o["hold_total"] * qty / o["qty_total"])
+                o["hold_remaining"] = max(ZERO, o["hold_remaining"] - rel)
+            if final:
+                o["hold_remaining"] = ZERO
+                o["open"] = False
+        return legs
+
+    def _add_lot(self, cid, symbol, qty, cost) -> None:
+        self.lot_seq += 1
+        self.lots[(cid, symbol)].append(
+            {"id": self.lot_seq, "qty": D(qty), "cost": money(cost)})
+
+    def _relieve_fifo(self, cid, symbol, qty) -> Decimal:
+        key = (cid, symbol)
+        lots = self.lots.get(key, [])
+        if sum((l["qty"] for l in lots), ZERO) < qty:
+            raise Rejected("oversell")
+        remaining, cost, kept = qty, ZERO, []
+        for l in lots:
+            if remaining <= ZERO:
+                kept.append(l)
+            elif l["qty"] <= remaining:
+                cost += l["cost"]
+                remaining -= l["qty"]
+            else:
+                relief = money(l["cost"] * remaining / l["qty"])
+                cost += relief
+                l["qty"] -= remaining
+                l["cost"] -= relief
+                remaining = ZERO
+                kept.append(l)
+        self.lots[key] = kept
+        return cost
 
     def on_trade_settled(self, p, ev):
         raise NotImplementedError
@@ -224,7 +312,7 @@ class Book:
         o = self.orders.get(p["order_id"])
         if o is not None:
             o["open"] = False
-            o["cash_hold"] = ZERO
+            o["hold_remaining"] = ZERO
         return []
 
     def on_order_rejected(self, p, ev):
@@ -283,8 +371,15 @@ class Book:
                 cust(cid)["wallet_cash"] += -bal
 
         for o in self.orders.values():
-            if o["open"] and o["cash_hold"] != ZERO:
-                cust(o["customer_id"])["cash_hold"] += o["cash_hold"]
+            if o["open"] and o["hold_remaining"] != ZERO:
+                cust(o["customer_id"])["cash_hold"] += o["hold_remaining"]
+
+        for (cid, symbol), lots in self.lots.items():
+            q = sum((l["qty"] for l in lots), ZERO)
+            if q != ZERO:
+                cost = sum((l["cost"] for l in lots), ZERO)
+                cust(cid)["positions"][symbol] = {
+                    "quantity": qstr(q), "cost_basis": str(money(cost))}
 
         routes = {oid: o["route"] for oid, o in self.orders.items()
                   if o["open"]}
