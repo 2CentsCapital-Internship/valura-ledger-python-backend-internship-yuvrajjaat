@@ -314,7 +314,20 @@ class Book:
         return cost
 
     def on_trade_settled(self, p, ev):
-        raise NotImplementedError
+        tr = self.trades.get(p["trade_id"])
+        if tr is None:
+            raise Rejected("trade_settled: unknown trade")
+        amt, cid = tr["principal"], tr["customer_id"]
+        if tr["side"] == "buy":
+            return [leg("2350", cid, debit=amt), leg("1100", cid, credit=amt)]
+        return [leg("1100", cid, debit=amt), leg("1150", cid, credit=amt)]
+
+    def _settle(self, cid, account) -> list[dict]:
+        accrued = money(-self.balances.get((cid, account), ZERO))
+        if accrued <= ZERO:
+            raise Rejected("nothing outstanding")
+        return [leg(account, cid, debit=accrued),
+                leg("1100", cid, credit=accrued)]
 
     def on_order_cancelled(self, p, ev):
         o = self.orders.get(p["order_id"])
@@ -327,16 +340,16 @@ class Book:
         return self.on_order_cancelled(p, ev)
 
     def on_broker_fees_settled(self, p, ev):
-        raise NotImplementedError
+        return self._settle(p["customer_id"], BROKER_PAYABLE[p["broker"]])
 
     def on_custodian_fees_settled(self, p, ev):
-        raise NotImplementedError
+        return self._settle(p["customer_id"], "2420")
 
     def on_reg_fees_remitted(self, p, ev):
-        raise NotImplementedError
+        return self._settle(p["customer_id"], "2400")
 
     def on_partner_payout(self, p, ev):
-        raise NotImplementedError
+        return self._settle(p["customer_id"], "2430")
 
     def on_dividend_cash(self, p, ev):
         cid, net = p["customer_id"], money(p["net_amount"])
