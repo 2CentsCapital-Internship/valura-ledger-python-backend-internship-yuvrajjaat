@@ -88,6 +88,7 @@ class Book:
         self.lots: dict[tuple[str, str], list] = defaultdict(list)
         self.lot_seq: int = 0
         self.trades: dict[str, dict] = {}
+        self.symbol_alias: dict[tuple[str, str], str] = {}
 
         self.todo: dict[str, int] = defaultdict(int)
         self.errors: list[tuple] = []
@@ -222,7 +223,7 @@ class Book:
     def _fill(self, p, final: bool) -> list[dict]:
         cid = p["customer_id"]
         side = p["side"]
-        symbol = p["symbol"]
+        symbol = self._resolve(cid, p["symbol"])
         qty = D(p["quantity"])
         principal = money(p["principal"])
 
@@ -278,6 +279,13 @@ class Book:
                 o["open"] = False
         return legs
 
+    def _resolve(self, cid, symbol):
+        seen = set()
+        while (cid, symbol) in self.symbol_alias and symbol not in seen:
+            seen.add(symbol)
+            symbol = self.symbol_alias[(cid, symbol)]
+        return symbol
+
     def _add_lot(self, cid, symbol, qty, cost) -> None:
         self.lot_seq += 1
         self.lots[(cid, symbol)].append(
@@ -331,16 +339,31 @@ class Book:
         raise NotImplementedError
 
     def on_dividend_cash(self, p, ev):
-        raise NotImplementedError
+        cid, net = p["customer_id"], money(p["net_amount"])
+        return [leg("1100", cid, debit=net), leg("2010", cid, credit=net)]
 
     def on_dividend_reinvested(self, p, ev):
-        raise NotImplementedError
+        cid, net = p["customer_id"], money(p["net_amount"])
+        sym = self._resolve(cid, p["symbol"])
+        self._add_lot(cid, sym, D(p["reinvest_quantity"]), net)
+        return [leg("1200", cid, debit=net), leg("2100", cid, credit=net)]
 
     def on_stock_split(self, p, ev):
-        raise NotImplementedError
+        cid = p["customer_id"]
+        factor = D(p["ratio_to"]) / D(p["ratio_from"])
+        for l in self.lots.get((cid, self._resolve(cid, p["symbol"])), []):
+            l["qty"] = l["qty"] * factor
+        return []
 
     def on_symbol_change(self, p, ev):
-        raise NotImplementedError
+        cid, old, new = p["customer_id"], p["old_symbol"], p["new_symbol"]
+        old = self._resolve(cid, old)
+        self.symbol_alias[(cid, old)] = new
+        src = self.lots.get((cid, old))
+        if src:
+            self.lots[(cid, new)].extend(src)
+            del self.lots[(cid, old)]
+        return []
 
     def on_reversal(self, p, ev):
         raise NotImplementedError
