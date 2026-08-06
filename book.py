@@ -89,6 +89,8 @@ class Book:
         self.lot_seq: int = 0
         self.trades: dict[str, dict] = {}
         self.symbol_alias: dict[tuple[str, str], str] = {}
+        self.event_lotops: dict[str, list] = {}
+        self._cur_ops: list = []
 
         self.todo: dict[str, int] = defaultdict(int)
         self.errors: list[tuple] = []
@@ -105,6 +107,7 @@ class Book:
         if handler is None:
             self.todo[ev["type"]] += 1
             return []
+        self._cur_ops = []
         try:
             legs = clean(handler(ev["payload"], ev) or [])
         except NotImplementedError:
@@ -121,6 +124,7 @@ class Book:
             return []
         self._post(legs)
         self.event_legs[eid] = legs
+        self.event_lotops[eid] = self._cur_ops
         return legs
 
     def _post(self, legs: list[dict]) -> None:
@@ -290,27 +294,32 @@ class Book:
         self.lot_seq += 1
         self.lots[(cid, symbol)].append(
             {"id": self.lot_seq, "qty": D(qty), "cost": money(cost)})
+        self._cur_ops.append(("add", (cid, symbol), self.lot_seq))
 
     def _relieve_fifo(self, cid, symbol, qty) -> Decimal:
         key = (cid, symbol)
         lots = self.lots.get(key, [])
         if sum((l["qty"] for l in lots), ZERO) < qty:
             raise Rejected("oversell")
-        remaining, cost, kept = qty, ZERO, []
-        for l in lots:
+        remaining, cost, kept, records = qty, ZERO, [], []
+        for idx, l in enumerate(lots):
             if remaining <= ZERO:
                 kept.append(l)
             elif l["qty"] <= remaining:
                 cost += l["cost"]
                 remaining -= l["qty"]
+                records.append(("full", dict(l), idx))
             else:
                 relief = money(l["cost"] * remaining / l["qty"])
                 cost += relief
                 l["qty"] -= remaining
                 l["cost"] -= relief
+                records.append(("part", l["id"], remaining, relief))
                 remaining = ZERO
                 kept.append(l)
         self.lots[key] = kept
+        if records:
+            self._cur_ops.append(("consume", key, records))
         return cost
 
     def on_trade_settled(self, p, ev):
@@ -363,9 +372,11 @@ class Book:
 
     def on_stock_split(self, p, ev):
         cid = p["customer_id"]
+        key = (cid, self._resolve(cid, p["symbol"]))
         factor = D(p["ratio_to"]) / D(p["ratio_from"])
-        for l in self.lots.get((cid, self._resolve(cid, p["symbol"])), []):
+        for l in self.lots.get(key, []):
             l["qty"] = l["qty"] * factor
+        self._cur_ops.append(("split", key, factor))
         return []
 
     def on_symbol_change(self, p, ev):
@@ -373,13 +384,55 @@ class Book:
         old = self._resolve(cid, old)
         self.symbol_alias[(cid, old)] = new
         src = self.lots.get((cid, old))
+        moved = [l["id"] for l in src] if src else []
         if src:
             self.lots[(cid, new)].extend(src)
             del self.lots[(cid, old)]
+        self._cur_ops.append(("rename", cid, old, new, moved))
         return []
 
     def on_reversal(self, p, ev):
-        raise NotImplementedError
+        src = p["reverses_event_id"]
+        if src not in self.events:
+            raise Rejected("reversal: unknown event")
+        for op in reversed(self.event_lotops.get(src, [])):
+            self._undo_lotop(op)
+        return [leg(l["account"], l["customer_id"],
+                    debit=l["credit"], credit=l["debit"])
+                for l in self.event_legs.get(src, [])]
+
+    def _undo_lotop(self, op) -> None:
+        kind = op[0]
+        if kind == "add":
+            _, key, lot_id = op
+            self.lots[key] = [l for l in self.lots.get(key, [])
+                              if l["id"] != lot_id]
+        elif kind == "consume":
+            _, key, records = op
+            lst = self.lots[key]
+            for rec in reversed(records):
+                if rec[0] == "part":
+                    _, lot_id, qd, cd = rec
+                    for l in lst:
+                        if l["id"] == lot_id:
+                            l["qty"] += qd
+                            l["cost"] += cd
+                            break
+                else:
+                    _, snap, idx = rec
+                    lst.insert(min(idx, len(lst)), dict(snap))
+        elif kind == "split":
+            _, key, factor = op
+            for l in self.lots.get(key, []):
+                l["qty"] = l["qty"] / factor
+        elif kind == "rename":
+            _, cid, old, new, moved = op
+            src = self.lots.get((cid, new), [])
+            back = [l for l in src if l["id"] in moved]
+            self.lots[(cid, new)] = [l for l in src if l["id"] not in moved]
+            if back:
+                self.lots[(cid, old)] = back + self.lots.get((cid, old), [])
+            self.symbol_alias.pop((cid, old), None)
 
     def snapshot(self, as_of_event_id: str | None = None) -> dict:
         if as_of_event_id is not None:
