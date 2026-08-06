@@ -43,6 +43,7 @@ class ArenaClient:
         self.book = Book()
         self.pending: list[dict] = []
         self.cursor = 0
+        self.started = False
         self.stats = {"events": 0, "posted": 0, "checkpoints": 0,
                       "reconnects": 0, "resets": 0, "errors": 0}
         self.done = False
@@ -112,10 +113,13 @@ class ArenaClient:
 
     def consume(self, http: httpx.Client, deadline: float) -> None:
         params = {"mode": self.mode, "from": self.cursor}
+        if self.mode != "practice" and not self.started:
+            params["new"] = "true"
         last_flush = time.time()
         with http.stream("GET", f"{self.url}/v1/stream", params=params,
                          timeout=httpx.Timeout(None, connect=20)) as r:
             r.raise_for_status()
+            self.started = True
             etype = data = None
             for line in r.iter_lines():
                 if time.time() > deadline:

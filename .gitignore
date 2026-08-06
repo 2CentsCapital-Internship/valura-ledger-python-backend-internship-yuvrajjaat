@@ -10,3 +10,6 @@ debug_*.jsonl
 
 # local testing helpers, not part of the assignment
 postman/
+
+# local run logs
+*.log

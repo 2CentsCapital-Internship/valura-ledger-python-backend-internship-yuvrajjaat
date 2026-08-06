@@ -231,10 +231,8 @@ class Book:
         qty = D(p["quantity"])
         principal = money(p["principal"])
 
-        o = self.orders.get(p.get("order_id"))
-        if o is not None:
-            if not o["open"] or qty > o["qty_total"] - o["qty_filled"]:
-                raise Rejected("overfill")
+        if p["trade_id"] in self.trades:
+            raise Rejected("duplicate trade")
 
         f = compute_fees(p["broker"], principal, D(p["partner_rate"]))
         b, c, r = f["b"], f["c"], f["r"]
@@ -273,6 +271,7 @@ class Book:
 
         self.trades[p["trade_id"]] = {"side": side, "principal": principal,
                                       "customer_id": cid}
+        o = self.orders.get(p.get("order_id"))
         if o is not None:
             o["qty_filled"] += qty
             if o["side"] == "buy" and not final and o["qty_total"] > ZERO:
