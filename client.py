@@ -192,6 +192,8 @@ def main() -> int:
     ap.add_argument("--seconds", type=float, default=1500)
     ap.add_argument("--debug", action="store_true",
                     help="log events/feedback to debug_*.jsonl (dev only)")
+    ap.add_argument("--resume", action="store_true",
+                    help="resume an already-running graded run (no new=true)")
     a = ap.parse_args()
 
     key = a.key
@@ -211,6 +213,8 @@ def main() -> int:
             return 1
 
     c = ArenaClient(a.url, key, a.mode, debug=a.debug)
+    if a.resume:
+        c.started = True
     print(f"connecting to {a.url} as {a.mode} ...", flush=True)
     out = c.run(a.seconds)
     print("\nstats:", json.dumps(out["stats"]))
